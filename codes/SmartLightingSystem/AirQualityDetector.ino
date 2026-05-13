@@ -20,7 +20,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // Thresholds
 int safeLimit = 30;      // Below 30% = SAFE
-int dangerLimit = 60;    // 30% to 59% = MODERATE, 60% and above = DANGER
+int dangerLimit = 80;    // 30% to 59% = MODERATE, 60% and above = DANGER
 
 // Most buzzer modules: HIGH = ON, LOW = OFF
 bool activeHighBuzzer = true;
