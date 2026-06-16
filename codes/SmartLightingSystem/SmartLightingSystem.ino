@@ -1,72 +1,397 @@
-// ESP32 LDR + Light Test
-// When dark, light turns ON
-// Brightness shown in percentage
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <ESP32Servo.h>
 
+// ================= OLED PINS =================
+#define OLED_SDA 21
+#define OLED_SCL 22
+
+// ================= OLED SETTINGS =================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+bool oledOK = false;
+
+// ================= SENSOR PINS =================
+#define PIR_PIN 17
+#define DHT_PIN 19
 #define LDR_PIN 34
-#define LIGHT_PIN 25
+#define MQ_PIN 35
 
-// Adjust this percentage after testing
+// ================= RELAY OUTPUT PINS =================
+#define FAN_RELAY_PIN 26
+#define BUZZER_RELAY_PIN 25
+#define LED_RELAY_PIN 27
+
+// ================= SERVO PIN =================
+#define SERVO_PIN 16
+
+Servo myservo;
+
+// ================= DHT SETTINGS =================
+#define DHT_TYPE DHT11
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ================= LDR SETTINGS =================
 int darkThresholdPercent = 30;
 
-// false = HIGH turns light ON
-// true  = LOW turns light ON, common for relay modules
-bool activeLowRelay = false;
+// Your LDR showed 4095 when dark, so false is correct
+bool brightValueIsHigh = false;
 
-// Set this based on your LDR module behavior
-// true  = raw value higher when brighter
-// false = raw value lower when brighter
-bool brightValueIsHigh = true;
+// ================= PIR SETTINGS =================
+// PIR OUT normally HIGH when motion is detected
+bool pirActiveHigh = true;
+
+// ================= SERVO SETTINGS =================
+int servoClosedAngle = 0;
+int servoOpenAngle = 90;
+
+// Servo stays open for 10 seconds after PIR detects movement
+unsigned long servoOpenTime = 10000;
+unsigned long lastMotionTime = 0;
+
+bool servoOpened = false;
+bool previousPersonDetected = false;
+
+// ================= SMOKE SETTINGS =================
+int safeLimit = 60;      // Below 60% = SAFE
+int dangerLimit = 80;    // 60% to 79% = MODERATE, 80% and above = DANGER
+
+// ================= RELAY SETTINGS =================
+// CW-020 relay modules are usually active LOW
+// LOW = relay ON, HIGH = relay OFF
+bool activeLowLEDRelay = true;
+bool activeLowBuzzerRelay = true;
+bool activeLowFanRelay = true;
+
+// ================= DHT TIMING =================
+float temperature = 0;
+float humidity = 0;
+bool dhtOK = false;
+
+unsigned long lastDHTRead = 0;
+unsigned long dhtInterval = 2000;
 
 void setup() {
-  Serial.begin(115200);
+Serial.begin(115200);
 
-  pinMode(LIGHT_PIN, OUTPUT);
-  setLight(false);
+pinMode(PIR_PIN, INPUT);
 
-  analogReadResolution(12); // ESP32 ADC: 0 to 4095
+pinMode(LED_RELAY_PIN, OUTPUT);
+pinMode(BUZZER_RELAY_PIN, OUTPUT);
+pinMode(FAN_RELAY_PIN, OUTPUT);
 
-  Serial.println("LDR Brightness Percentage Test Started");
+// Start all relays OFF
+setLEDRelay(false);
+setBuzzerRelay(false);
+setFanRelay(false);
+
+analogReadResolution(12);
+
+// Start DHT sensor
+dht.begin();
+
+// Start servo
+myservo.setPeriodHertz(50);
+myservo.attach(SERVO_PIN, 500, 2400);
+myservo.write(servoClosedAngle);
+
+// Start OLED
+Wire.begin(OLED_SDA, OLED_SCL);
+
+if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+oledOK = true;
+
+display.clearDisplay();  
+display.setTextColor(SSD1306_WHITE);  
+display.setTextSize(1);  
+
+display.setCursor(0, 0);  
+display.println("Smart Room System");  
+display.println("Starting...");  
+display.display();  
+
+Serial.println("OLED detected.");
+
+} else {
+oledOK = false;
+Serial.println("OLED not detected. System continues without OLED.");
+}
+
+delay(2000);
+
+Serial.println("System Started");
 }
 
 void loop() {
-  int ldrRaw = analogRead(LDR_PIN);
+// ================= LDR READING =================
+int ldrRaw = analogRead(LDR_PIN);
 
-  int brightnessPercent;
+int brightnessPercent;
 
-  if (brightValueIsHigh == true) {
-    brightnessPercent = map(ldrRaw, 0, 4095, 0, 100);
-  } else {
-    brightnessPercent = map(ldrRaw, 0, 4095, 100, 0);
-  }
-
-  brightnessPercent = constrain(brightnessPercent, 0, 100);
-
-  bool isDark = brightnessPercent < darkThresholdPercent;
-
-  if (isDark) {
-    setLight(true);
-    Serial.println("Status: DARK → Light ON");
-  } else {
-    setLight(false);
-    Serial.println("Status: BRIGHT → Light OFF");
-  }
-
-  Serial.print("Brightness: ");
-  Serial.print(brightnessPercent);
-  Serial.print("%");
-  Serial.print(" | Dark Threshold: ");
-  Serial.print(darkThresholdPercent);
-  Serial.println("%");
-
-  Serial.println("-------------------------");
-
-  delay(1000);
+if (brightValueIsHigh == true) {
+brightnessPercent = map(ldrRaw, 0, 4095, 0, 100);
+} else {
+brightnessPercent = map(ldrRaw, 0, 4095, 100, 0);
 }
 
-void setLight(bool state) {
-  if (activeLowRelay == true) {
-    digitalWrite(LIGHT_PIN, state ? LOW : HIGH);
-  } else {
-    digitalWrite(LIGHT_PIN, state ? HIGH : LOW);
-  }
+brightnessPercent = constrain(brightnessPercent, 0, 100);
+
+bool isDark = brightnessPercent < darkThresholdPercent;
+
+// ================= PIR READING =================
+int pirValue = digitalRead(PIR_PIN);
+
+bool personDetected;
+
+if (pirActiveHigh == true) {
+personDetected = pirValue == HIGH;
+} else {
+personDetected = pirValue == LOW;
 }
+
+String pirStatus = personDetected ? "YES" : "NO";
+
+// ================= SERVO CONTROL FOR PIR L MODE =================
+String servoStatus;
+
+// Trigger only when PIR changes from NO motion to motion
+if (personDetected == true && previousPersonDetected == false) {
+myservo.write(servoOpenAngle);
+lastMotionTime = millis();
+servoOpened = true;
+}
+
+// After 10 seconds, return servo to 0 degree
+if (servoOpened == true && millis() - lastMotionTime >= servoOpenTime) {
+myservo.write(servoClosedAngle);
+servoOpened = false;
+}
+
+previousPersonDetected = personDetected;
+
+if (servoOpened == true) {
+servoStatus = "90";
+} else {
+servoStatus = "0";
+}
+
+// ================= LED RELAY CONTROL =================
+// LED relay ON when dark
+String ledRelayStatus;
+
+if (isDark) {
+setLEDRelay(true);
+ledRelayStatus = "ON";
+} else {
+setLEDRelay(false);
+ledRelayStatus = "OFF";
+}
+
+// ================= MQ SMOKE READING =================
+int mqRaw = analogRead(MQ_PIN);
+
+int smokePercent = map(mqRaw, 0, 4095, 0, 100);
+smokePercent = constrain(smokePercent, 0, 100);
+
+String airStatus;
+
+if (smokePercent < safeLimit) {
+airStatus = "SAFE";
+}
+else if (smokePercent < dangerLimit) {
+airStatus = "MODERATE";
+}
+else {
+airStatus = "DANGER";
+}
+
+// Buzzer relay ON when smoke is detected
+bool smokeDetected = smokePercent >= safeLimit;
+
+// Fan relay ON only when danger
+bool dangerDetected = smokePercent >= dangerLimit;
+
+setBuzzerRelay(smokeDetected);
+setFanRelay(dangerDetected);
+
+String buzzerRelayStatus = smokeDetected ? "ON" : "OFF";
+String fanRelayStatus = dangerDetected ? "ON" : "OFF";
+
+// ================= DHT TEMPERATURE & HUMIDITY =================
+if (millis() - lastDHTRead >= dhtInterval) {
+lastDHTRead = millis();
+
+temperature = dht.readTemperature();  
+humidity = dht.readHumidity();  
+
+if (isnan(temperature) || isnan(humidity)) {  
+  dhtOK = false;  
+  Serial.println("Failed to read from DHT sensor!");  
+} else {  
+  dhtOK = true;  
+}
+
+}
+
+// ================= OLED DISPLAY =================
+if (oledOK == true) {
+showOLED(
+brightnessPercent,
+pirStatus,
+servoStatus,
+ledRelayStatus,
+smokePercent,
+airStatus,
+fanRelayStatus,
+buzzerRelayStatus,
+temperature,
+humidity,
+dhtOK
+);
+}
+
+// ================= SERIAL MONITOR OUTPUT =================
+Serial.print("LDR Raw: ");
+Serial.print(ldrRaw);
+
+Serial.print(" | Brightness: ");
+Serial.print(brightnessPercent);
+Serial.print("%");
+
+Serial.print(" | PIR: ");
+Serial.print(pirStatus);
+
+Serial.print(" | Servo: ");
+Serial.print(servoStatus);
+Serial.print(" deg");
+
+Serial.print(" | LED Relay: ");
+Serial.print(ledRelayStatus);
+
+Serial.print(" | MQ Raw: ");
+Serial.print(mqRaw);
+
+Serial.print(" | Smoke: ");
+Serial.print(smokePercent);
+Serial.print("%");
+
+Serial.print(" | Air: ");
+Serial.print(airStatus);
+
+Serial.print(" | Fan Relay: ");
+Serial.print(fanRelayStatus);
+
+Serial.print(" | Buzzer Relay: ");
+Serial.print(buzzerRelayStatus);
+
+if (dhtOK == true) {
+Serial.print(" | Temp: ");
+Serial.print(temperature);
+Serial.print(" C");
+
+Serial.print(" | Humidity: ");  
+Serial.print(humidity);  
+Serial.print("%");
+
+} else {
+Serial.print(" | DHT: ERROR");
+}
+
+Serial.println();
+Serial.println("--------------------------------");
+
+delay(300);
+}
+
+// ================= RELAY CONTROL FUNCTIONS =================
+
+void setLEDRelay(bool state) {
+if (activeLowLEDRelay == true) {
+digitalWrite(LED_RELAY_PIN, state ? LOW : HIGH);
+} else {
+digitalWrite(LED_RELAY_PIN, state ? HIGH : LOW);
+}
+}
+
+void setBuzzerRelay(bool state) {
+if (activeLowBuzzerRelay == true) {
+digitalWrite(BUZZER_RELAY_PIN, state ? LOW : HIGH);
+} else {
+digitalWrite(BUZZER_RELAY_PIN, state ? HIGH : LOW);
+}
+}
+
+void setFanRelay(bool state) {
+if (activeLowFanRelay == true) {
+digitalWrite(FAN_RELAY_PIN, state ? LOW : HIGH);
+} else {
+digitalWrite(FAN_RELAY_PIN, state ? HIGH : LOW);
+}
+}
+
+// ================= OLED DISPLAY FUNCTION =================
+void showOLED(
+int brightnessPercent,
+String pirStatus,
+String servoStatus,
+String ledRelayStatus,
+int smokePercent,
+String airStatus,
+String fanRelayStatus,
+String buzzerRelayStatus,
+float temperature,
+float humidity,
+bool dhtOK
+) {
+display.clearDisplay();
+
+display.setTextSize(1);
+display.setCursor(0, 0);
+display.println("Smart Room System");
+
+display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+display.setCursor(0, 13);
+display.print("B:");
+display.print(brightnessPercent);
+display.print("% PIR:");
+display.println(pirStatus);
+
+display.setCursor(0, 23);
+display.print("Servo:");
+display.print(servoStatus);
+display.print(" LED:");
+display.println(ledRelayStatus);
+
+display.setCursor(0, 33);
+display.print("Smoke:");
+display.print(smokePercent);
+display.print("% ");
+display.println(airStatus);
+
+display.setCursor(0, 43);
+display.print("Fan:");
+display.print(fanRelayStatus);
+display.print(" Buzz:");
+display.println(buzzerRelayStatus);
+
+display.setCursor(0, 53);
+if (dhtOK == true) {
+display.print("T:");
+display.print(temperature, 1);
+display.print("C H:");
+display.print(humidity, 0);
+display.println("%");
+} else {
+display.println("DHT Error");
+}
+
+display.display();
+} could you share the full connection
