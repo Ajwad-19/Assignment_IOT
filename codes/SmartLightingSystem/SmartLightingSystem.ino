@@ -1,10 +1,9 @@
 /*************************************************************
   BLYNK SETTINGS
 *************************************************************/
-
-#define BLYNK_TEMPLATE_ID "TMPL6uf9E0kmK"
+#define BLYNK_TEMPLATE_ID   "TMPL6uf9E0kmK"
 #define BLYNK_TEMPLATE_NAME "Smart Room System"
-#define BLYNK_AUTH_TOKEN "QNUGwVi35fPH5frUQGR0xW569otnxc5y"
+#define BLYNK_AUTH_TOKEN    "QNUGwVi35fPH5frUQGR0xW569otnxc5y"
 
 #define BLYNK_PRINT Serial
 
@@ -20,9 +19,8 @@
 /*************************************************************
   WIFI SETTINGS
 *************************************************************/
-
 char ssid[] = "jed";
-char pass[] = "YOUR_WIFI_PASSWORD";
+char pass[] = "YOUR_WIFI_PASSWORD";   // <-- put your WiFi password here
 
 BlynkTimer timer;
 
@@ -43,16 +41,15 @@ bool oledOK = false;
 #define PIR_PIN 17
 #define DHT_PIN 19
 #define LDR_PIN 34
-#define MQ_PIN 35
+#define MQ_PIN  35
 
 // ================= RELAY OUTPUT PINS =================
-#define FAN_RELAY_PIN 26
+#define FAN_RELAY_PIN    26
 #define BUZZER_RELAY_PIN 25
-#define LED_RELAY_PIN 27
+#define LED_RELAY_PIN    27
 
 // ================= SERVO PIN =================
 #define SERVO_PIN 16
-
 Servo myservo;
 
 // ================= DHT SETTINGS =================
@@ -61,38 +58,39 @@ DHT dht(DHT_PIN, DHT_TYPE);
 
 // ================= LDR SETTINGS =================
 int darkThresholdPercent = 30;
-
 // Your LDR showed 4095 when dark, so false is correct
 bool brightValueIsHigh = false;
 
 // ================= PIR SETTINGS =================
-// PIR OUT normally HIGH when motion is detected
+// PIR OUT goes HIGH when motion is detected
 bool pirActiveHigh = true;
 
 // ================= SERVO SETTINGS =================
 int servoClosedAngle = 0;
-int servoOpenAngle = 90;
+int servoOpenAngle   = 90;     // change to 180 if your door needs a wider swing
 
-// Servo stays open for 10 seconds after PIR detects movement
-unsigned long servoOpenTime = 10000;
-unsigned long lastMotionTime = 0;
+// After motion stops, wait this long before closing the servo
+unsigned long servoCloseDelay = 3000;   // ms
+unsigned long noMotionStartTime = 0;
 
-bool servoOpened = false;
-bool previousPersonDetected = false;
+// Startup protection: do not attach/move servo until first motion
+bool servoAttached       = false;
+bool servoIsOpen         = false;
+bool noMotionTimerStarted = false;
 
 // ================= SMOKE SETTINGS =================
-int safeLimit = 60;      // Below 60% = SAFE
-int dangerLimit = 80;    // 60% to 79% = MODERATE, 80% and above = DANGER
+int safeLimit   = 60;   // below 60%      = SAFE  (buzzer turns on at/above this)
+int dangerLimit = 80;   // 60% to 79%     = MODERATE
+                        // 80% and above  = DANGER (fan trigger)
 
 // ================= TEMPERATURE FAN SETTINGS =================
-float fanTemperatureLimit = 40.0;  // Fan ON when temperature >= 40C
+float fanTemperatureLimit = 40.0;   // Fan ON when temperature >= 40C
 
 // ================= RELAY SETTINGS =================
-// CW-020 relay modules are usually active LOW
-// LOW = relay ON, HIGH = relay OFF
-bool activeLowLEDRelay = true;
+// CW-020 relay modules are usually active LOW (LOW = ON, HIGH = OFF)
+bool activeLowLEDRelay    = true;
 bool activeLowBuzzerRelay = true;
-bool activeLowFanRelay = true;
+bool activeLowFanRelay    = true;
 
 // ================= SENSOR VALUES =================
 int ldrRaw = 0;
@@ -103,7 +101,7 @@ int pirValue = 0;
 bool personDetected = false;
 String pirStatus = "NO";
 
-String servoStatus = "0";
+String servoStatus = "WAIT";   // WAIT until first motion (startup protection)
 String ledRelayStatus = "OFF";
 
 int mqRaw = 0;
@@ -112,6 +110,7 @@ String airStatus = "SAFE";
 
 String fanRelayStatus = "OFF";
 String buzzerRelayStatus = "OFF";
+String fanReason = "OFF";      // OFF / SMOKE / TEMP / SMOKE+TEMP
 
 float temperature = 0;
 float humidity = 0;
@@ -127,11 +126,11 @@ unsigned long blynkConnectInterval = 10000;
 /*************************************************************
   SETUP
 *************************************************************/
-
 void setup() {
   Serial.begin(115200);
 
-  pinMode(PIR_PIN, INPUT);
+  // INPUT_PULLDOWN keeps the PIR pin from floating when idle
+  pinMode(PIR_PIN, INPUT_PULLDOWN);
 
   pinMode(LED_RELAY_PIN, OUTPUT);
   pinMode(BUZZER_RELAY_PIN, OUTPUT);
@@ -144,13 +143,11 @@ void setup() {
 
   analogReadResolution(12);
 
-  // Start DHT sensor
   dht.begin();
 
-  // Start servo
-  myservo.setPeriodHertz(50);
-  myservo.attach(SERVO_PIN, 500, 2400);
-  myservo.write(servoClosedAngle);
+  // NOTE: Servo is intentionally NOT attached here.
+  // It attaches on the first motion event so it does not
+  // twitch during power-up.
 
   // Start OLED
   Wire.begin(OLED_SDA, OLED_SCL);
@@ -173,13 +170,12 @@ void setup() {
     Serial.println("OLED not detected. System continues without OLED.");
   }
 
-  // Start WiFi and Blynk
+  // Start WiFi and Blynk (non-blocking)
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, pass);
-
   Blynk.config(BLYNK_AUTH_TOKEN);
 
-  // Send data to Blynk every 1 second
+  // Push data to Blynk every 1 second
   timer.setInterval(1000L, sendToBlynk);
 
   delay(2000);
@@ -190,9 +186,7 @@ void setup() {
 /*************************************************************
   LOOP
 *************************************************************/
-
 void loop() {
-  // Blynk non-blocking connection
   handleBlynkConnection();
 
   if (Blynk.connected()) {
@@ -209,19 +203,7 @@ void loop() {
   controlFanBySmokeOrTemperature();
 
   if (oledOK == true) {
-    showOLED(
-      brightnessPercent,
-      pirStatus,
-      servoStatus,
-      ledRelayStatus,
-      smokePercent,
-      airStatus,
-      fanRelayStatus,
-      buzzerRelayStatus,
-      temperature,
-      humidity,
-      dhtOK
-    );
+    showOLED();
   }
 
   printSerialMonitor();
@@ -243,7 +225,6 @@ void readLDR() {
   }
 
   brightnessPercent = constrain(brightnessPercent, 0, 100);
-
   isDark = brightnessPercent < darkThresholdPercent;
 }
 
@@ -251,33 +232,53 @@ void readPIRAndControlServo() {
   pirValue = digitalRead(PIR_PIN);
 
   if (pirActiveHigh == true) {
-    personDetected = pirValue == HIGH;
+    personDetected = (pirValue == HIGH);
   } else {
-    personDetected = pirValue == LOW;
+    personDetected = (pirValue == LOW);
   }
 
   pirStatus = personDetected ? "YES" : "NO";
 
-  // Trigger only when PIR changes from NO motion to motion
-  if (personDetected == true && previousPersonDetected == false) {
-    myservo.write(servoOpenAngle);
-    lastMotionTime = millis();
-    servoOpened = true;
+  // Presence-based behavior:
+  //  - motion present  -> attach (first time) and open, keep open
+  //  - motion gone      -> after servoCloseDelay, close
+  if (personDetected == true) {
+    noMotionTimerStarted = false;
+
+    if (servoAttached == false) {
+      myservo.setPeriodHertz(50);
+      myservo.attach(SERVO_PIN, 500, 2400);
+      servoAttached = true;
+    }
+
+    if (servoIsOpen == false) {
+      myservo.write(servoOpenAngle);
+      servoIsOpen = true;
+    }
+  } else {
+    if (servoIsOpen == true) {
+      if (noMotionTimerStarted == false) {
+        noMotionStartTime = millis();
+        noMotionTimerStarted = true;
+      }
+
+      if (millis() - noMotionStartTime >= servoCloseDelay) {
+        myservo.write(servoClosedAngle);
+        servoIsOpen = false;
+        noMotionTimerStarted = false;
+      }
+    }
   }
 
-  // After 10 seconds, return servo to 0 degree
-  if (servoOpened == true && millis() - lastMotionTime >= servoOpenTime) {
-    myservo.write(servoClosedAngle);
-    servoOpened = false;
+  if (servoAttached == false) {
+    servoStatus = "WAIT";
+  } else {
+    servoStatus = servoIsOpen ? String(servoOpenAngle) : String(servoClosedAngle);
   }
-
-  previousPersonDetected = personDetected;
-
-  servoStatus = servoOpened ? "90" : "0";
 }
 
 void controlLEDRelay() {
-  // LED relay ON when dark
+  // LED relay ON when the room is dark
   if (isDark) {
     setLEDRelay(true);
     ledRelayStatus = "ON";
@@ -301,9 +302,8 @@ void readMQAndControlSmokeSystem() {
     airStatus = "DANGER";
   }
 
-  // Buzzer ON when smoke is moderate or danger
+  // Buzzer ON as soon as smoke leaves the SAFE band
   bool smokeDetected = smokePercent >= safeLimit;
-
   setBuzzerRelay(smokeDetected);
   buzzerRelayStatus = smokeDetected ? "ON" : "OFF";
 }
@@ -325,20 +325,22 @@ void readDHT() {
 }
 
 void controlFanBySmokeOrTemperature() {
-  bool dangerDetected = smokePercent >= dangerLimit;
-  bool highTemperatureDetected = false;
+  bool smokeDangerDetected     = smokePercent >= dangerLimit;
+  bool highTemperatureDetected = (dhtOK == true && temperature >= fanTemperatureLimit);
 
-  if (dhtOK == true && temperature >= fanTemperatureLimit) {
-    highTemperatureDetected = true;
-  }
+  bool fanShouldTurnOn = smokeDangerDetected || highTemperatureDetected;
 
-  // Fan ON if smoke is danger OR temperature is 40C and above
-  if (dangerDetected || highTemperatureDetected) {
-    setFanRelay(true);
-    fanRelayStatus = "ON";
+  setFanRelay(fanShouldTurnOn);
+  fanRelayStatus = fanShouldTurnOn ? "ON" : "OFF";
+
+  if (smokeDangerDetected && highTemperatureDetected) {
+    fanReason = "SMOKE+TEMP";
+  } else if (smokeDangerDetected) {
+    fanReason = "SMOKE";
+  } else if (highTemperatureDetected) {
+    fanReason = "TEMP";
   } else {
-    setFanRelay(false);
-    fanRelayStatus = "OFF";
+    fanReason = "OFF";
   }
 }
 
@@ -350,7 +352,6 @@ void handleBlynkConnection() {
   if (WiFi.status() == WL_CONNECTED && !Blynk.connected()) {
     if (millis() - lastBlynkConnectAttempt >= blynkConnectInterval) {
       lastBlynkConnectAttempt = millis();
-
       Serial.println("Trying to connect to Blynk...");
       Blynk.connect(3000);
     }
@@ -375,6 +376,9 @@ void sendToBlynk() {
     Blynk.virtualWrite(V8, temperature);
     Blynk.virtualWrite(V9, humidity);
   }
+
+  // New: fan reason (add a V10 datastream in Blynk if you want this on the dashboard)
+  Blynk.virtualWrite(V10, fanReason);
 }
 
 /*************************************************************
@@ -409,19 +413,7 @@ void setFanRelay(bool state) {
   OLED DISPLAY FUNCTION
 *************************************************************/
 
-void showOLED(
-  int brightnessPercent,
-  String pirStatus,
-  String servoStatus,
-  String ledRelayStatus,
-  int smokePercent,
-  String airStatus,
-  String fanRelayStatus,
-  String buzzerRelayStatus,
-  float temperature,
-  float humidity,
-  bool dhtOK
-) {
+void showOLED() {
   display.clearDisplay();
 
   display.setTextSize(1);
@@ -451,8 +443,8 @@ void showOLED(
   display.setCursor(0, 43);
   display.print("Fan:");
   display.print(fanRelayStatus);
-  display.print(" Buzz:");
-  display.println(buzzerRelayStatus);
+  display.print(" ");
+  display.println(fanReason);
 
   display.setCursor(0, 53);
   if (dhtOK == true) {
@@ -460,9 +452,9 @@ void showOLED(
     display.print(temperature, 1);
     display.print("C H:");
     display.print(humidity, 0);
-    display.println("%");
+    display.print("%");
   } else {
-    display.println("DHT Error");
+    display.print("DHT Error");
   }
 
   display.display();
@@ -491,7 +483,6 @@ void printSerialMonitor() {
 
   Serial.print(" | Servo: ");
   Serial.print(servoStatus);
-  Serial.print(" deg");
 
   Serial.print(" | LED Relay: ");
   Serial.print(ledRelayStatus);
@@ -508,6 +499,9 @@ void printSerialMonitor() {
 
   Serial.print(" | Fan Relay: ");
   Serial.print(fanRelayStatus);
+
+  Serial.print(" | Fan Reason: ");
+  Serial.print(fanReason);
 
   Serial.print(" | Buzzer Relay: ");
   Serial.print(buzzerRelayStatus);
